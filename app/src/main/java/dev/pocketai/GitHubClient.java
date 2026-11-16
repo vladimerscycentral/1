@@ -89,6 +89,32 @@ final class GitHubClient {
               "commit", new JSONObject(written).getJSONObject("commit").getString("html_url"))
           .toString();
     }
+    if (r.code == 404
+        && !path.isEmpty()
+        && (op.equals("github_read") || op.equals("github_list"))) {
+      // A 404 may also mean the repository, branch or token is inaccessible. Verify the
+      // root listing for the same ref before treating a path as missing.
+      ChatClient.Response root = raw("GET", route("/contents/?ref=" + encode(branch)), null);
+      if (root.code != 200) {
+        throw new IOException(
+            "GitHub HTTP 404. Не удалось проверить репозиторий и ветку. Проверь owner/repo,"
+                + " ветку и права токена на Contents.");
+      }
+      try {
+        new JSONArray(root.body);
+      } catch (JSONException invalidRoot) {
+        throw new IOException("GitHub вернул неверный список файлов. Проверь подключение.");
+      }
+      return AppState.object(
+              "found",
+              false,
+              "path",
+              path,
+              "message",
+              "GitHub не нашёл этот путь в доступной ветке. "
+                  + "Если нужен новый файл, создай его через github_write без sha.")
+          .toString();
+    }
     if (r.code != 200) throw new IOException("GitHub HTTP " + r.code);
     if (op.equals("github_list")) {
       JSONArray files = new JSONArray(r.body), result = new JSONArray();

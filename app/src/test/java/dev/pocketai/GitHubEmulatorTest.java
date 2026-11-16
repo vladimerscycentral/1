@@ -21,6 +21,9 @@ public class GitHubEmulatorTest {
     GitHubClient gh = new GitHubClient(call, base, token, "pocket-test/pocket-fixture", "main");
     assertEquals("pocket-test", gh.connect());
     String file = "fixture-" + System.nanoTime() + ".txt";
+    JSONObject missing = new JSONObject(gh.contents("github_read", file, "", ""));
+    assertFalse(missing.getBoolean("found"));
+    assertEquals(file, missing.getString("path"));
     gh.contents("github_write", file, "first", "");
     JSONObject read = new JSONObject(gh.contents("github_read", file, "", ""));
     assertEquals("first", read.getString("content"));

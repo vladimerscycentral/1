@@ -73,7 +73,9 @@ final class AgentFiles {
         + "{\"op\":\"github_list\",\"path\":\"\"}\n"
         + "```. Дождись результата перед следующим действием. Для write: path и content (полный"
         + " новый текст UTF-8, максимум 24000 символов). Сначала прочитай существующий файл. Для"
-        + " github_write передай sha из github_read. Для новой локальной папки local_mkdir."
+        + " github_write передай sha из github_read. Если github_read или github_list сообщает"
+        + " found=false после проверки доступа, при необходимости создай файл через github_write"
+        + " без sha. Для новой локальной папки local_mkdir."
         + " github_write может создавать вложенные пути. github_build запускает только workflow из"
         + " настроек (inputs — объект при необходимости). github_runs возвращает последние сборки"
         + " выбранного workflow и ветки, сравни sha коммита. github_jobs требует run_id; возвращает"
@@ -95,7 +97,7 @@ final class AgentFiles {
               ? "Доступ к файлам телефона отключён. "
                   + (prefs.getBoolean("github", false)
                       ? "Используй github_list, github_read и github_write. Для вложенных папок"
-                            + " укажи полный путь файла в github_write; local_mkdir не нужен."
+                          + " укажи полный путь файла в github_write; local_mkdir не нужен."
                       : "Попроси пользователя включить доступ к файлам телефона или GitHub.")
               : "Доступ к GitHub отключён. Попроси пользователя включить его в настройках.";
       throw new AgentRunner.ActionNotStartedException(message);

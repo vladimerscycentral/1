@@ -23,6 +23,8 @@ public class GitHubClientTest {
   int dispatches;
   boolean fileMissing;
   int rootStatus = 200;
+  int writeStatus = 200;
+  String errorMessage = "", rateRemaining = "", sso = "";
 
   @Before
   public void start() throws Exception {
@@ -58,6 +60,16 @@ public class GitHubClientTest {
                                   .encodeToString(content.getBytes(StandardCharsets.UTF_8)))
                           .toString();
                 else {
+                  if (writeStatus != 200) {
+                    MockResponse denied =
+                        new MockResponse()
+                            .setResponseCode(writeStatus)
+                            .setBody(new JSONObject().put("message", errorMessage).toString());
+                    if (!rateRemaining.isEmpty())
+                      denied.addHeader("X-RateLimit-Remaining", rateRemaining);
+                    if (!sso.isEmpty()) denied.addHeader("X-GitHub-SSO", sso);
+                    return denied;
+                  }
                   JSONObject body = new JSONObject(e.getBody().readUtf8());
                   assertEquals("feature/tabs", body.getString("branch"));
                   if (fileMissing) {
@@ -132,9 +144,9 @@ public class GitHubClientTest {
                 assertTrue(
                     history.getJSONObject(1).getString("content").contains("\"found\":false"));
                 return "```pocket-action\n"
-                           + "{\"op\":\"github_write\",\"path\":\"build.gradle\",\"content\":\"plugins"
-                           + " {}\"}\n"
-                           + "```";
+                    + "{\"op\":\"github_write\",\"path\":\"build.gradle\",\"content\":\"plugins"
+                    + " {}\"}\n"
+                    + "```";
               }
               return "готово";
             },
@@ -187,6 +199,81 @@ public class GitHubClientTest {
     JSONObject response = new JSONObject(client.contents("github_list", "src/main", "", ""));
     assertFalse(response.getBoolean("found"));
     assertEquals("src/main", response.getString("path"));
+  }
+
+  @Test
+  public void missingTokenPermissionShowsSafeGuidanceWithoutRetryingWrite() throws Exception {
+    fileMissing = true;
+    writeStatus = 403;
+    errorMessage = "Resource not accessible by personal access token: synthetic-test-token";
+    String output =
+        AgentRunner.run(
+            new JSONArray(),
+            true,
+            history ->
+                "```pocket-action\n"
+                    + "{\"op\":\"github_write\",\"path\":\"test_write.txt\",\"content\":\"test\"}\n"
+                    + "```",
+            a ->
+                client.contents(
+                    a.getString("op"),
+                    a.optString("path"),
+                    a.optString("content"),
+                    a.optString("sha")),
+            (role, message) -> {},
+            () -> {});
+    assertTrue(output.contains("токену не хватает доступа"));
+    assertTrue(output.contains("Contents: Read and write"));
+    assertFalse(output.contains("synthetic-test-token"));
+    assertEquals(1, requests.stream().filter(r -> r.startsWith("PUT")).count());
+    assertEquals("old", content);
+  }
+
+  @Test
+  public void protectedBranchShowsSpecificGuidance() throws Exception {
+    writeStatus = 403;
+    errorMessage = "GH006: Protected branch update failed for refs/heads/main.";
+    try {
+      client.contents("github_write", "a.txt", "new", currentSha);
+      fail();
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("запрещают прямую запись"));
+    }
+    assertEquals("old", content);
+  }
+
+  @Test
+  public void rateLimitAndSsoAreExplained() throws Exception {
+    writeStatus = 403;
+    rateRemaining = "0";
+    try {
+      client.contents("github_write", "a.txt", "new", currentSha);
+      fail();
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("лимит запросов"));
+    }
+    rateRemaining = "";
+    sso = "required; url=https://example.invalid/secret";
+    try {
+      client.contents("github_write", "a.txt", "new", currentSha);
+      fail();
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("SSO"));
+      assertFalse(e.getMessage().contains("example.invalid"));
+    }
+  }
+
+  @Test
+  public void unknown403DoesNotLeakServerMessage() throws Exception {
+    writeStatus = 403;
+    errorMessage = "synthetic-test-token private server details";
+    try {
+      client.contents("github_write", "a.txt", "new", currentSha);
+      fail();
+    } catch (IOException e) {
+      assertTrue(e.getMessage().contains("GitHub HTTP 403"));
+      assertFalse(e.getMessage().contains("private"));
+    }
   }
 
   @Test

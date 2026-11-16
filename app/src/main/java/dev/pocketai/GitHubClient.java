@@ -5,6 +5,7 @@ import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.Locale;
 import org.json.*;
 
 /** Only talks to the configured repository. Tokens never enter model context. */
@@ -45,13 +46,43 @@ final class GitHubClient {
 
   private String request(String method, String path, JSONObject body) throws IOException {
     ChatClient.Response r = raw(method, path, body);
-    if (r.code < 200 || r.code >= 300)
-      throw new IOException(
-          "GitHub HTTP "
-              + r.code
-              + ". Проверь токен, права, ветку и защиту репозитория. Для записи или сборки при"
-              + " сетевом сбое сначала проверь результат.");
+    if (r.code < 200 || r.code >= 300) throw failure(r);
     return r.body;
+  }
+
+  private IOException failure(ChatClient.Response response) {
+    String guidance = "Проверь токен, права, ветку и защиту репозитория.";
+    if (response.code == 403) {
+      String message = "";
+      try {
+        message = new JSONObject(response.body).optString("message").toLowerCase(Locale.ROOT);
+      } catch (JSONException ignored) {
+        /* Keep the generic message for unknown responses. */
+      }
+      if (response.githubSsoRequired) {
+        guidance = "Организация требует авторизовать токен через SSO в настройках GitHub.";
+      } else if (response.githubRateLimited || message.contains("rate limit")) {
+        guidance = "Превышен лимит запросов GitHub. Подожди и попробуй позже.";
+      } else if (message.contains("resource not accessible by personal access token")
+          || message.contains("resource not accessible by integration")) {
+        guidance =
+            "GitHub сообщает, что токену не хватает доступа. Проверь владельца, выбранный"
+                + " репозиторий и Contents: Read and write в настройках токена.";
+      } else if (message.contains("protected branch")
+          || message.contains("repository rule violations")
+          || message.contains("changes must be made through a pull request")) {
+        guidance =
+            "Правила репозитория запрещают прямую запись в эту ветку. Используй ветку,"
+                + " в которую разрешено записывать, или обратись к владельцу репозитория.";
+      }
+    }
+    // Never expose raw server messages: they can contain sensitive or untrusted text.
+    return new IOException(
+        "GitHub HTTP "
+            + response.code
+            + ". "
+            + guidance
+            + " Для записи или сборки при сетевом сбое сначала проверь результат.");
   }
 
   String connect() throws Exception {
@@ -81,7 +112,7 @@ final class GitHubClient {
           throw new IOException(
               "Версия изменилась или sha не указан. Сначала прочитай текущий файл.");
         body.put("sha", actual);
-      } else if (r.code != 404) throw new IOException("GitHub HTTP " + r.code);
+      } else if (r.code != 404) throw failure(r);
       else if (!sha.isEmpty())
         throw new IOException("Файл удалён после чтения. Проверь путь перед созданием.");
       String written = request("PUT", url, body);
@@ -115,7 +146,7 @@ final class GitHubClient {
                   + "Если нужен новый файл, создай его через github_write без sha.")
           .toString();
     }
-    if (r.code != 200) throw new IOException("GitHub HTTP " + r.code);
+    if (r.code != 200) throw failure(r);
     if (op.equals("github_list")) {
       JSONArray files = new JSONArray(r.body), result = new JSONArray();
       for (int i = 0; i < files.length() && i < 100; i++) {

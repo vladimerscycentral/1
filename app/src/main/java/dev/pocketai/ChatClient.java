@@ -45,10 +45,17 @@ public final class ChatClient {
   static final class Response {
     final int code;
     final String body;
+    final boolean githubRateLimited, githubSsoRequired;
 
     Response(int code, String body) {
+      this(code, body, false, false);
+    }
+
+    Response(int code, String body, boolean githubRateLimited, boolean githubSsoRequired) {
       this.code = code;
       this.body = body;
+      this.githubRateLimited = githubRateLimited;
+      this.githubSsoRequired = githubSsoRequired;
     }
   }
 
@@ -96,7 +103,34 @@ public final class ChatClient {
           }
         }
         int code = c.getResponseCode();
-        if (code < 200 || code >= 300) return new Response(code, "");
+        if (code < 200 || code >= 300) {
+          if (!github || code != 403) return new Response(code, "");
+          String detail = "";
+          try (InputStream error = c.getErrorStream();
+              ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            if (error != null) {
+              byte[] chunk = new byte[4096];
+              int n;
+              while ((n = error.read(chunk)) != -1) {
+                check();
+                if (out.size() + n > 16384) {
+                  out.reset();
+                  break;
+                }
+                out.write(chunk, 0, n);
+              }
+              detail = out.toString("UTF-8");
+            }
+          } catch (IOException ignored) {
+            check(); // Respect cancellation; otherwise retain the HTTP status.
+          }
+          String sso = c.getHeaderField("X-GitHub-SSO");
+          return new Response(
+              code,
+              detail,
+              "0".equals(c.getHeaderField("X-RateLimit-Remaining")),
+              sso != null && sso.toLowerCase(Locale.ROOT).contains("required"));
+        }
         try (InputStream in = c.getInputStream();
             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
           byte[] bytes = new byte[8192];

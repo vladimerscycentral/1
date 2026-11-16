@@ -1,0 +1,25 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'dev.pocketai'
+    compileSdk 35
+    defaultConfig { applicationId 'dev.pocketai'; minSdk 26; targetSdk 35; versionCode 3; versionName '1.2' }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    def customStore = System.getenv('POCKET_SIGNING_STORE_FILE')
+    if (customStore) {
+        signingConfigs {
+            supplied {
+                storeFile file(customStore)
+                storePassword System.getenv('POCKET_SIGNING_STORE_PASSWORD')
+                keyAlias System.getenv('POCKET_SIGNING_KEY_ALIAS')
+                keyPassword System.getenv('POCKET_SIGNING_KEY_PASSWORD')
+            }
+        }
+        buildTypes.debug.signingConfig signingConfigs.supplied
+    }
+    testOptions { unitTests.includeAndroidResources = true }
+}
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}

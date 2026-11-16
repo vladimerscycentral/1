@@ -3,7 +3,12 @@ package dev.pocketai;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.*;
 
@@ -46,33 +51,104 @@ public final class ChatClient {
     final int code;
     final String body;
     final boolean githubRateLimited, githubSsoRequired;
+    final String retryAfter;
 
     Response(int code, String body) {
-      this(code, body, false, false);
+      this(code, body, false, false, null);
     }
 
     Response(int code, String body, boolean githubRateLimited, boolean githubSsoRequired) {
+      this(code, body, githubRateLimited, githubSsoRequired, null);
+    }
+
+    Response(
+        int code,
+        String body,
+        boolean githubRateLimited,
+        boolean githubSsoRequired,
+        String retryAfter) {
       this.code = code;
       this.body = body;
       this.githubRateLimited = githubRateLimited;
       this.githubSsoRequired = githubSsoRequired;
+      this.retryAfter = retryAfter;
     }
   }
 
   public static final class Call {
+    interface WaitStrategy {
+      void waitFor(long millis) throws IOException;
+    }
+
+    public interface RetryListener {
+      void waiting(long millis, int attempt);
+
+      void retrying();
+    }
+
+    private static final int MAX_RETRIES = 2;
+    private static final long MAX_WAIT_MS = 60000;
     private final AtomicBoolean cancelled = new AtomicBoolean();
+    private final CountDownLatch cancelSignal = new CountDownLatch(1);
+    private final WaitStrategy waitStrategy;
     private volatile HttpURLConnection connection;
+
+    public Call() {
+      this.waitStrategy = this::waitForCancellation;
+    }
+
+    Call(WaitStrategy waitStrategy) {
+      this.waitStrategy = waitStrategy;
+    }
 
     public void cancel() {
       cancelled.set(true);
+      cancelSignal.countDown();
       HttpURLConnection c = connection;
       if (c != null) c.disconnect();
+    }
+
+    boolean isCancelled() {
+      return cancelled.get();
     }
 
     void check() throws IOException {
       if (cancelled.get() || Thread.currentThread().isInterrupted())
         throw new IOException(
             "Остановлено. Проверь результат уже отправленных изменений перед повтором.");
+    }
+
+    private void waitForCancellation(long millis) throws IOException {
+      try {
+        cancelSignal.await(millis, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException("Запрос остановлен.", e);
+      }
+      check();
+    }
+
+    // Retry-After is either nonnegative seconds or an HTTP date. -1 means absent/invalid.
+    static long retryAfterMillis(String value, long nowMillis) {
+      if (value == null || value.trim().isEmpty()) return -1;
+      String trimmed = value.trim();
+      if (trimmed.matches("[0-9]+")) {
+        try {
+          long seconds = Long.parseLong(trimmed);
+          return seconds > Long.MAX_VALUE / 1000 ? Long.MAX_VALUE : seconds * 1000;
+        } catch (NumberFormatException overflow) {
+          return Long.MAX_VALUE;
+        }
+      }
+      try {
+        long dateMillis =
+            ZonedDateTime.parse(trimmed, DateTimeFormatter.RFC_1123_DATE_TIME)
+                .toInstant()
+                .toEpochMilli();
+        return dateMillis <= nowMillis ? 0 : dateMillis - nowMillis;
+      } catch (DateTimeParseException | ArithmeticException invalid) {
+        return -1;
+      }
     }
 
     Response request(String url, String token, String method, JSONObject body, boolean github)
@@ -104,6 +180,8 @@ public final class ChatClient {
         }
         int code = c.getResponseCode();
         if (code < 200 || code >= 300) {
+          if (!github && code == 429)
+            return new Response(code, "", false, false, c.getHeaderField("Retry-After"));
           if (!github || code != 403) return new Response(code, "");
           String detail = "";
           try (InputStream error = c.getErrorStream();
@@ -151,6 +229,17 @@ public final class ChatClient {
 
     public String chat(String base, String key, String model, String system, JSONArray history)
         throws Exception {
+      return chat(base, key, model, system, history, null);
+    }
+
+    public String chat(
+        String base,
+        String key,
+        String model,
+        String system,
+        JSONArray history,
+        RetryListener listener)
+        throws Exception {
       if (model.trim().isEmpty()) throw new IOException("Укажи модель в настройках.");
       JSONArray messages = new JSONArray();
       messages.put(AppState.object("role", "system", "content", system));
@@ -158,13 +247,35 @@ public final class ChatClient {
       while (start < history.length()
           && !"user".equals(history.getJSONObject(start).optString("role"))) start++;
       for (int i = start; i < history.length(); i++) messages.put(history.getJSONObject(i));
-      Response r =
-          request(
-              base + "/chat/completions",
-              key,
-              "POST",
-              AppState.object("model", model, "stream", false, "messages", messages),
-              false);
+      JSONObject body = AppState.object("model", model, "stream", false, "messages", messages);
+      Response r;
+      int retries = 0;
+      while (true) {
+        check();
+        r = request(base + "/chat/completions", key, "POST", body, false);
+        if (r.code != 429) break;
+        long requested = retryAfterMillis(r.retryAfter, System.currentTimeMillis());
+        if (retries >= MAX_RETRIES || requested > MAX_WAIT_MS) {
+          String delay =
+              requested > MAX_WAIT_MS && requested != Long.MAX_VALUE
+                  ? " Сервер просит подождать не меньше "
+                      + (requested / 1000 + (requested % 1000 == 0 ? 0 : 1))
+                      + " сек."
+                  : "";
+          throw new IOException(
+              "API модели: HTTP 429. Достигнут лимит запросов."
+                  + delay
+                  + " Подожди и нажми «Продолжить» или выбери другую модель. Проверь лимиты"
+                  + " провайдера.");
+        }
+        long delay = requested >= 0 ? Math.max(1000, requested) : (5000L << retries);
+        retries++;
+        if (listener != null) listener.waiting(delay, retries);
+        check();
+        waitStrategy.waitFor(delay);
+        check();
+        if (listener != null) listener.retrying();
+      }
       if (r.code != 200)
         throw new IOException(
             "API модели: HTTP " + r.code + ". Проверь ключ, адрес и доступность модели.");
@@ -192,6 +303,9 @@ public final class ChatClient {
 
     public List<String> models(String base, String key) throws Exception {
       Response r = request(base + "/models", key, "GET", null, false);
+      if (r.code == 429)
+        throw new IOException(
+            "Список моделей: HTTP 429. Лимит запросов. Подожди и попробуй снова.");
       if (r.code != 200) throw new IOException("Список моделей: HTTP " + r.code);
       JSONArray data = new JSONObject(r.body).getJSONArray("data");
       List<String> ids = new ArrayList<>();

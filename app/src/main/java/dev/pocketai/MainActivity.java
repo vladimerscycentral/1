@@ -486,15 +486,22 @@ public final class MainActivity extends Activity {
       show(2);
       return;
     }
-    String value =
-        resume
-            ? "Продолжи задачу с учётом последних результатов. Сначала проверь состояние предыдущих"
-                + " изменений."
-            : state.draft.trim();
-    if (value.isEmpty()) return;
-    state.message(id, "user", value);
-    state.draft = "";
-    composer.setText("");
+    if (!resume) {
+      String value = state.draft.trim();
+      if (value.isEmpty()) return;
+      state.message(id, "user", value);
+      state.draft = "";
+      composer.setText("");
+    } else {
+      JSONObject last = state.history.optJSONObject(state.history.length() - 1);
+      if (last == null || !"user".equals(last.optString("role"))) {
+        state.message(
+            id,
+            "user",
+            "Продолжи задачу с учётом последних результатов. Сначала проверь состояние предыдущих"
+                + " изменений.");
+      }
+    }
     state.save();
     final JSONArray history = AppState.array(state.history.toString());
     final String model = state.model, key = apiKey;
@@ -509,7 +516,41 @@ public final class MainActivity extends Activity {
           return AgentRunner.run(
               history,
               auto,
-              messages -> call.chat(base, key, model, system, messages),
+              messages ->
+                  call.chat(
+                      base,
+                      key,
+                      model,
+                      system,
+                      messages,
+                      new ChatClient.Call.RetryListener() {
+                        @Override
+                        public void waiting(long millis, int attempt) {
+                          runOnUiThread(
+                              () -> {
+                                if (isDestroyed() || current != call || !busy || call.isCancelled())
+                                  return;
+                                status =
+                                    "Лимит API модели. Повтор через "
+                                        + ((millis + 999) / 1000)
+                                        + " сек. ("
+                                        + attempt
+                                        + "/2)";
+                                if (page == 0) show(0);
+                              });
+                        }
+
+                        @Override
+                        public void retrying() {
+                          runOnUiThread(
+                              () -> {
+                                if (isDestroyed() || current != call || !busy || call.isCancelled())
+                                  return;
+                                status = "Повторный запрос к модели…";
+                                if (page == 0) show(0);
+                              });
+                        }
+                      }),
               agent::execute,
               (role, text) -> publish(id, role, text),
               call::check);

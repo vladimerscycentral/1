@@ -97,6 +97,44 @@ public class MainActivityTest {
   }
 
   @Test
+  public void continuingAfter429DoesNotDuplicateUserMessagesOrEraseDraft() throws Exception {
+    try (okhttp3.mockwebserver.MockWebServer server = new okhttp3.mockwebserver.MockWebServer()) {
+      server.start();
+      for (int i = 0; i < 2; i++)
+        server.enqueue(
+            new okhttp3.mockwebserver.MockResponse()
+                .setResponseCode(429)
+                .addHeader("Retry-After", "120"));
+      AppState initial = new AppState(RuntimeEnvironment.getApplication());
+      initial.endpoint = server.url("/v1").toString();
+      initial.localHttp = true;
+      initial.model = "model";
+      initial.message(initial.activeId, "user", "Исходное задание");
+      initial.draft = "черновик";
+      initial.save();
+      try (var controller = Robolectric.buildActivity(MainActivity.class).setup()) {
+        View root = controller.get().getWindow().getDecorView();
+        for (int i = 0; i < 2; i++) {
+          assertNotNull(find(root, "Продолжить"));
+          find(root, "Продолжить").performClick();
+          assertNotNull(server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS));
+          long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+          while (find(root, "Продолжить") == null && System.nanoTime() < until) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
+            Thread.sleep(20);
+          }
+          org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle();
+          assertNotNull("request must complete", find(root, "Продолжить"));
+        }
+        AppState saved = new AppState(RuntimeEnvironment.getApplication());
+        assertEquals(1, saved.history.length());
+        assertEquals("Исходное задание", saved.history.optJSONObject(0).optString("content"));
+        assertEquals("черновик", saved.draft);
+      }
+    }
+  }
+
+  @Test
   public void opensCreatesTabsAndSettings() {
     try (var controller = Robolectric.buildActivity(MainActivity.class).setup()) {
       MainActivity a = controller.get();

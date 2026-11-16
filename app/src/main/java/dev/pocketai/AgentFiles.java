@@ -61,7 +61,9 @@ final class AgentFiles {
         + prefs.getBoolean("local", false)
         + ", github="
         + prefs.getBoolean("github", false)
-        + ". Репозиторий="
+        + ". Не используй local_* при local=false или github_* при github=false. При работе с"
+        + " GitHub создавай вложенные пути сразу через github_write, не используй local_mkdir."
+        + " Репозиторий="
         + prefs.getString("repo", "")
         + ", ветка="
         + prefs.getString("branch", "main")
@@ -87,6 +89,17 @@ final class AgentFiles {
     call.check();
     String op = a.getString("op");
     if (!validOp(op)) throw new IOException("Неизвестное действие.");
+    if (!accessAllowed(op)) {
+      String message =
+          op.startsWith("local_")
+              ? "Доступ к файлам телефона отключён. "
+                  + (prefs.getBoolean("github", false)
+                      ? "Используй github_list, github_read и github_write. Для вложенных папок"
+                            + " укажи полный путь файла в github_write; local_mkdir не нужен."
+                      : "Попроси пользователя включить доступ к файлам телефона или GitHub.")
+              : "Доступ к GitHub отключён. Попроси пользователя включить его в настройках.";
+      throw new AgentRunner.ActionNotStartedException(message);
+    }
     check(op);
     String relative = path(a.optString("path")), content = a.optString("content");
     if (op.endsWith("_write") && !(a.opt("content") instanceof String))
@@ -104,10 +117,13 @@ final class AgentFiles {
     return gh.contents(op, relative, content, a.optString("sha"));
   }
 
+  private boolean accessAllowed(String op) {
+    return prefs.getBoolean(op.startsWith("local_") ? "local" : "github", false);
+  }
+
   private void check(String op) throws IOException {
     call.check();
-    if (!prefs.getBoolean(op.startsWith("local_") ? "local" : "github", false))
-      throw new IOException("Доступ отключён в настройках.");
+    if (!accessAllowed(op)) throw new IOException("Доступ отключён в настройках.");
   }
 
   private Uri child(Uri parent, String name) throws IOException {

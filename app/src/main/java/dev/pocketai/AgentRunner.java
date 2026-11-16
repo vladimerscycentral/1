@@ -4,6 +4,13 @@ import org.json.*;
 
 /** One bounded, cancellable sequence. A failed mutation is never retried automatically. */
 final class AgentRunner {
+  /** A request rejected before any local or remote operation has started. */
+  static final class ActionNotStartedException extends java.io.IOException {
+    ActionNotStartedException(String message) {
+      super(message);
+    }
+  }
+
   interface Model {
     String reply(JSONArray history) throws Exception;
   }
@@ -37,6 +44,7 @@ final class AgentRunner {
       Journal journal,
       Cancellation cancellation)
       throws Exception {
+    int rejectedInARow = 0;
     for (int step = 0; step <= 24; step++) {
       cancellation.check();
       String answer = model.reply(history);
@@ -50,6 +58,16 @@ final class AgentRunner {
       String outcome;
       try {
         outcome = tools.execute(action);
+        rejectedInARow = 0;
+      } catch (ActionNotStartedException error) {
+        // This exception can only be raised before any filesystem or network operation.
+        String value = result(action, "Действие не выполнено: " + error.getMessage());
+        history.put(AppState.object("role", "user", "content", value));
+        journal.append("user", value);
+        if (++rejectedInARow >= 3)
+          return "Несколько действий отклонены из-за настроек доступа. Проверь настройки и"
+                     + " продолжи.";
+        continue;
       } catch (Exception error) {
         // The server may have applied a write even if the response was lost.
         outcome =

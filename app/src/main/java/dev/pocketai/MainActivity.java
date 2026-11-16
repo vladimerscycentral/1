@@ -32,6 +32,10 @@ public final class MainActivity extends Activity {
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
   private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor();
   private Future<?> deadline;
+  private final Map<JSONObject, Boolean> expandedWork = new WeakHashMap<>();
+  private final Map<String, Integer> chatScrollPositions = new HashMap<>();
+  private final Map<String, Boolean> chatFollowsEnd = new HashMap<>();
+  private ScrollView chatScroll;
 
   private SharedPreferences access() {
     return getSharedPreferences("agent", 0);
@@ -76,11 +80,16 @@ public final class MainActivity extends Activity {
 
   private void capture() {
     if (composer != null) state.draft = composer.getText().toString();
+    if (chatScroll != null) {
+      chatScrollPositions.put(state.activeId, chatScroll.getScrollY());
+      chatFollowsEnd.put(state.activeId, !chatScroll.canScrollVertically(1));
+    }
   }
 
   private void show(int selected) {
     capture();
     composer = null;
+    chatScroll = null;
     page = selected;
     nav.removeAllViews();
     pane.removeAllViews();
@@ -111,6 +120,7 @@ public final class MainActivity extends Activity {
           v -> {
             capture();
             composer = null;
+            chatScroll = null;
             state.select(id);
             status = "";
             show(0);
@@ -123,6 +133,7 @@ public final class MainActivity extends Activity {
         v -> {
           capture();
           composer = null;
+          chatScroll = null;
           state.create();
           status = "";
           show(0);
@@ -148,6 +159,7 @@ public final class MainActivity extends Activity {
                   "Удалить",
                   (d, w) -> {
                     composer = null;
+                    chatScroll = null;
                     state.deleteActive();
                     show(0);
                   })
@@ -158,6 +170,8 @@ public final class MainActivity extends Activity {
     export.setOnClickListener(v -> exportChat());
     add(pane, actions, 4);
     ScrollView scroll = new ScrollView(this);
+    chatScroll = scroll;
+    final String displayedChat = state.activeId;
     LinearLayout messages = column();
     scroll.addView(messages);
     pane.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -175,38 +189,17 @@ public final class MainActivity extends Activity {
           12);
       add(messages, welcome, 12);
     }
-    for (int i = 0; i < state.history.length(); i++) {
-      JSONObject m = state.history.optJSONObject(i);
-      if (m == null) continue;
-      String value = m.optString("content");
-      boolean assistant = m.optString("role").equals("assistant");
-      LinearLayout bubble = card();
-      bubble.addView(
-          text(
-              assistant ? "✦ МОДЕЛЬ" : value.startsWith("Результат действия") ? "ДЕЙСТВИЕ" : "ТЫ",
-              11,
-              GREEN,
-              true));
-      TextView body = text(value, 15, TEXT, false);
-      body.setTextIsSelectable(true);
-      android.text.util.Linkify.addLinks(body, android.text.util.Linkify.WEB_URLS);
-      add(bubble, body, 8);
-      Button copy = button("Копировать", false);
-      copy.setOnClickListener(
-          v -> {
-            ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
-                .setPrimaryClip(ClipData.newPlainText("Pocket AI", value));
-            toast("Скопировано");
-          });
-      add(bubble, copy, 8);
-      JSONObject action =
-          assistant && i == state.history.length() - 1 ? AgentFiles.action(value) : null;
-      if (action != null && !busy) {
-        Button execute = button("Выполнить: " + action.optString("op"), true);
-        add(bubble, execute, 6);
-        execute.setOnClickListener(v -> confirm(action));
+    for (int i = 0; i < state.history.length(); ) {
+      JSONObject message = state.history.optJSONObject(i);
+      JSONObject action = actionOf(message);
+      if (action == null) {
+        if (message != null) add(messages, messageBubble(message, i), 10);
+        i++;
+        continue;
       }
-      add(messages, bubble, 10);
+      int end = workEnd(i);
+      add(messages, workGroup(i, end), 10);
+      i = end;
     }
     if (busy)
       add(
@@ -252,7 +245,153 @@ public final class MainActivity extends Activity {
           } else send(false);
         });
     add(pane, input, 8);
-    scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
+    boolean followEnd = chatFollowsEnd.getOrDefault(displayedChat, true);
+    int previousScroll = chatScrollPositions.getOrDefault(displayedChat, 0);
+    scroll.post(
+        () -> {
+          if (followEnd) scroll.fullScroll(View.FOCUS_DOWN);
+          else scroll.scrollTo(0, previousScroll);
+        });
+  }
+
+  private JSONObject actionOf(JSONObject message) {
+    return message != null && "assistant".equals(message.optString("role"))
+        ? AgentFiles.action(message.optString("content"))
+        : null;
+  }
+
+  /** Consume adjacent assistant action/result pairs without hiding ordinary user messages. */
+  private int workEnd(int start) {
+    int index = start;
+    while (index < state.history.length()) {
+      JSONObject action = actionOf(state.history.optJSONObject(index));
+      if (action == null) break;
+      index++;
+      JSONObject result = state.history.optJSONObject(index);
+      String prefix = AgentRunner.result(action, "");
+      if (result == null
+          || !"user".equals(result.optString("role"))
+          || !result.optString("content").startsWith(prefix)) break;
+      index++;
+    }
+    return index;
+  }
+
+  private LinearLayout workGroup(int start, int end) {
+    JSONObject anchor = state.history.optJSONObject(start);
+    boolean pendingAction =
+        end == state.history.length()
+            && actionOf(state.history.optJSONObject(end - 1)) != null
+            && !busy;
+    boolean expanded = expandedWork.getOrDefault(anchor, pendingAction);
+    int count = 0;
+    boolean hasError = false;
+    JSONObject lastAction = null;
+    for (int i = start; i < end; i++) {
+      JSONObject message = state.history.optJSONObject(i);
+      JSONObject nextAction = actionOf(message);
+      if (nextAction != null) {
+        count++;
+        lastAction = nextAction;
+      } else if (message != null
+          && lastAction != null
+          && "user".equals(message.optString("role"))) {
+        String value = message.optString("content");
+        if (value.startsWith(AgentRunner.result(lastAction, "Ошибка действия."))) hasError = true;
+      }
+    }
+    LinearLayout group = card();
+    final String title = "Ход работы · действий: " + count + (hasError ? " · ошибка" : "");
+    Button toggle = button((expanded ? "▾ " : "▸ ") + title, false);
+    toggle.setContentDescription(title + (expanded ? ": свернуть" : ": развернуть"));
+    group.addView(toggle);
+    if (lastAction != null) {
+      String path = lastAction.optString("path");
+      add(
+          group,
+          text(
+              actionLabel(lastAction.optString("op")) + (path.isEmpty() ? "" : ": " + path),
+              12,
+              MUTED,
+              false),
+          6);
+    }
+    LinearLayout details = column();
+    group.addView(details);
+    if (expanded) populateWork(details, start, end);
+    details.setVisibility(expanded ? View.VISIBLE : View.GONE);
+    toggle.setOnClickListener(
+        v -> {
+          boolean opening = details.getVisibility() != View.VISIBLE;
+          if (opening && details.getChildCount() == 0) populateWork(details, start, end);
+          details.setVisibility(opening ? View.VISIBLE : View.GONE);
+          expandedWork.put(anchor, opening);
+          toggle.setText((opening ? "▾ " : "▸ ") + title);
+          toggle.setContentDescription(title + (opening ? ": свернуть" : ": развернуть"));
+        });
+    return group;
+  }
+
+  private String actionLabel(String op) {
+    switch (op) {
+      case "local_list":
+      case "github_list":
+        return "Просмотр файлов";
+      case "local_read":
+      case "github_read":
+        return "Чтение файла";
+      case "local_write":
+      case "github_write":
+        return "Запись файла";
+      case "local_mkdir":
+        return "Создание папки";
+      case "github_build":
+        return "Запуск сборки";
+      case "github_runs":
+      case "github_jobs":
+        return "Проверка сборки";
+      default:
+        return "Действие";
+    }
+  }
+
+  private void populateWork(LinearLayout details, int start, int end) {
+    for (int i = start; i < end; i++) {
+      JSONObject message = state.history.optJSONObject(i);
+      if (message != null) add(details, messageBubble(message, i), 8);
+    }
+  }
+
+  private LinearLayout messageBubble(JSONObject message, int index) {
+    String value = message.optString("content");
+    boolean assistant = "assistant".equals(message.optString("role"));
+    LinearLayout bubble = card();
+    bubble.addView(
+        text(
+            assistant ? "✦ МОДЕЛЬ" : value.startsWith("Результат действия") ? "ДЕЙСТВИЕ" : "ТЫ",
+            11,
+            GREEN,
+            true));
+    TextView body = text(value, 15, TEXT, false);
+    body.setTextIsSelectable(true);
+    android.text.util.Linkify.addLinks(body, android.text.util.Linkify.WEB_URLS);
+    add(bubble, body, 8);
+    Button copy = button("Копировать", false);
+    copy.setOnClickListener(
+        v -> {
+          ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
+              .setPrimaryClip(ClipData.newPlainText("Pocket AI", value));
+          toast("Скопировано");
+        });
+    add(bubble, copy, 8);
+    JSONObject action =
+        assistant && index == state.history.length() - 1 ? AgentFiles.action(value) : null;
+    if (action != null && !busy) {
+      Button execute = button("Выполнить: " + action.optString("op"), true);
+      add(bubble, execute, 6);
+      execute.setOnClickListener(v -> confirm(action));
+    }
+    return bubble;
   }
 
   private void renameChat() {
